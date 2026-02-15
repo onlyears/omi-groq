@@ -26,8 +26,9 @@ LANGUAGE = os.environ.get("LANGUAGE", "ja")
 PROMPT = os.environ.get("PROMPT", "日本語の会話です")
 CHUNK_SECONDS = int(os.environ.get("CHUNK_SECONDS", "5"))
 
+LOG_LEVEL = os.environ.get("LOG_LEVEL", "DEBUG")
 logging.basicConfig(
-    level=logging.INFO,
+    level=getattr(logging, LOG_LEVEL, logging.DEBUG),
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 logger = logging.getLogger("omi-groq-stt")
@@ -208,8 +209,10 @@ async def transcribe_groq(audio_data: bytes, filename: str = "audio.wav") -> lis
     """Groq Whisper APIで文字起こし"""
     from groq import Groq
 
+    logger.info(f"Sending to Groq: filename={filename}, size={len(audio_data)} bytes")
+
     try:
-        client = Groq(api_key=GROQ_API_KEY)
+        client = Groq(api_key=GROQ_API_KEY, timeout=30.0)
 
         transcription = await asyncio.to_thread(
             client.audio.transcriptions.create,
@@ -221,25 +224,46 @@ async def transcribe_groq(audio_data: bytes, filename: str = "audio.wav") -> lis
             response_format="verbose_json",
         )
 
+        # デバッグ: Groqからの生レスポンスをログ出力
+        raw_text = getattr(transcription, "text", "")
+        raw_segments = getattr(transcription, "segments", None)
+        logger.info(f"Groq raw response: text='{raw_text}', segments_count={len(raw_segments) if raw_segments else 0}")
+
         segments = []
 
-        if hasattr(transcription, "segments") and transcription.segments:
-            for seg in transcription.segments:
+        if raw_segments:
+            for seg in raw_segments:
+                # seg はdictまたはPydanticオブジェクトの可能性がある
+                if isinstance(seg, dict):
+                    no_speech = seg.get("no_speech_prob", 0)
+                    text = seg.get("text", "").strip()
+                    start = seg.get("start", 0.0)
+                    end = seg.get("end", 0.0)
+                else:
+                    no_speech = getattr(seg, "no_speech_prob", 0) or 0
+                    text = (getattr(seg, "text", "") or "").strip()
+                    start = getattr(seg, "start", 0.0) or 0.0
+                    end = getattr(seg, "end", 0.0) or 0.0
+
+                logger.debug(f"Segment: text='{text}', no_speech={no_speech}")
+
                 # 無音確率が高いセグメントはスキップ
-                if seg.get("no_speech_prob", 0) > 0.7:
+                if no_speech > 0.7:
+                    logger.info(f"Skipped (no_speech={no_speech}): '{text}'")
                     continue
-                text = seg.get("text", "").strip()
                 if not text or is_hallucination(text):
+                    if text:
+                        logger.info(f"Skipped (hallucination): '{text}'")
                     continue
                 segments.append({
                     "text": text,
                     "speaker": "SPEAKER_00",
-                    "start": seg.get("start", 0.0),
-                    "end": seg.get("end", 0.0),
+                    "start": start,
+                    "end": end,
                 })
 
-        elif hasattr(transcription, "text") and transcription.text.strip():
-            text = transcription.text.strip()
+        elif raw_text and raw_text.strip():
+            text = raw_text.strip()
             if not is_hallucination(text):
                 segments.append({
                     "text": text,
@@ -247,12 +271,14 @@ async def transcribe_groq(audio_data: bytes, filename: str = "audio.wav") -> lis
                     "start": 0.0,
                     "end": 0.0,
                 })
+            else:
+                logger.info(f"Skipped (hallucination): '{text}'")
 
         logger.info(f"Transcribed: {len(segments)} segments")
         return segments
 
     except Exception as e:
-        logger.error(f"Groq API error: {e}")
+        logger.error(f"Groq API error: {e}", exc_info=True)
         return []
 
 
