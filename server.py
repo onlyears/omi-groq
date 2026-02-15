@@ -26,9 +26,9 @@ LANGUAGE = os.environ.get("LANGUAGE", "ja")
 PROMPT = os.environ.get("PROMPT", "日本語の会話です")
 CHUNK_SECONDS = int(os.environ.get("CHUNK_SECONDS", "5"))
 
-LOG_LEVEL = os.environ.get("LOG_LEVEL", "DEBUG")
+LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO")
 logging.basicConfig(
-    level=getattr(logging, LOG_LEVEL, logging.DEBUG),
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 logger = logging.getLogger("omi-groq-stt")
@@ -153,6 +153,21 @@ def pcm8_to_pcm16(data: bytes) -> bytes:
     for i, b in enumerate(data):
         struct.pack_into("<h", result, i * 2, (b - 128) << 8)
     return bytes(result)
+
+
+def _is_likely_pcm16(data: bytes) -> bool:
+    """pcm8と報告されたデータが実はPCM16 LEかどうかをヒューリスティックで判定。
+
+    PCM16 LEの無音〜小音量では、上位バイト（奇数位置）が 0x00 か 0xFF に
+    集中する。真のpcm8なら128付近にばらけるはず。
+    """
+    if len(data) < 200:
+        return False
+    high_bytes = data[1::2][:200]
+    near_zero = sum(1 for b in high_bytes if b <= 0x02 or b >= 0xFD)
+    ratio = near_zero / len(high_bytes)
+    logger.debug(f"PCM format detection: {ratio:.0%} of high bytes near 0x00/0xFF")
+    return ratio > 0.6
 
 
 # ============================================================
@@ -320,10 +335,16 @@ async def listen(websocket: WebSocket):
             segments = await transcribe_groq(ogg_data, "audio.ogg")
 
         elif not is_opus and len(pcm_buffer) > 0:
-            if codec == "pcm8":
-                pcm16_data = pcm8_to_pcm16(bytes(pcm_buffer))
+            raw_data = bytes(pcm_buffer)
+            if codec == "pcm8" and _is_likely_pcm16(raw_data):
+                # Omiアプリがpcm8と報告するが実際はPCM16 LEデータの場合
+                logger.info(f"Auto-detected PCM16 LE data (codec reported: {codec}), "
+                            f"buffer={len(raw_data)} bytes")
+                pcm16_data = raw_data
+            elif codec == "pcm8":
+                pcm16_data = pcm8_to_pcm16(raw_data)
             else:
-                pcm16_data = bytes(pcm_buffer)
+                pcm16_data = raw_data
             chunk_duration = len(pcm16_data) / (sample_rate * 2)
             wav_data = pcm_to_wav(pcm16_data, sample_rate)
             pcm_buffer = bytearray()
