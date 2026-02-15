@@ -195,16 +195,29 @@ HALLUCINATION_PATTERNS = [
     "http",
 ]
 
+# 無音区間でWhisperが頻繁に生成する短い幻覚フレーズ（完全一致）
+HALLUCINATION_EXACT = {
+    "はい。", "はい", "うん。", "うん", "ええ。", "ええ",
+    "えー。", "えー", "あ。", "あ", "oh.", "oh", "yes.",
+    "hmm.", "hmm", "yeah.", "yeah", "okay.", "okay",
+    "uh.", "uh", "um.", "um",
+}
+
 
 def is_hallucination(text: str) -> bool:
     """Whisperのよくある幻覚パターンを検出"""
-    t = text.strip().lower()
+    t = text.strip()
 
     if len(t) < 2:
         return True
 
+    # 無音区間での短い幻覚（完全一致）
+    if t in HALLUCINATION_EXACT:
+        return True
+
+    t_lower = t.lower()
     for pattern in HALLUCINATION_PATTERNS:
-        if pattern.lower() in t:
+        if pattern.lower() in t_lower:
             return True
 
     # 同じ短いフレーズが繰り返されるパターン
