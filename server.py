@@ -24,7 +24,7 @@ GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "whisper-large-v3")
 LANGUAGE = os.environ.get("LANGUAGE", "ja")
 PROMPT = os.environ.get("PROMPT", "日本語の会話です")
-CHUNK_SECONDS = int(os.environ.get("CHUNK_SECONDS", "5"))
+CHUNK_SECONDS = int(os.environ.get("CHUNK_SECONDS", "10"))
 
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO")
 logging.basicConfig(
@@ -153,6 +153,20 @@ def pcm8_to_pcm16(data: bytes) -> bytes:
     for i, b in enumerate(data):
         struct.pack_into("<h", result, i * 2, (b - 128) << 8)
     return bytes(result)
+
+
+def _pcm16_rms(data: bytes) -> float:
+    """PCM16 LEデータのRMS（二乗平均平方根）音量を計算。
+    無音判定に使用。16-bit signed PCMの最大値は32768。
+    """
+    if len(data) < 2:
+        return 0.0
+    n_samples = len(data) // 2
+    total = 0
+    for i in range(0, n_samples * 2, 2):
+        sample = int.from_bytes(data[i:i+2], "little", signed=True)
+        total += sample * sample
+    return (total / n_samples) ** 0.5
 
 
 def _is_likely_pcm16(data: bytes) -> bool:
@@ -351,18 +365,25 @@ async def listen(websocket: WebSocket):
             raw_data = bytes(pcm_buffer)
             if codec == "pcm8" and _is_likely_pcm16(raw_data):
                 # Omiアプリがpcm8と報告するが実際はPCM16 LEデータの場合
-                logger.info(f"Auto-detected PCM16 LE data (codec reported: {codec}), "
-                            f"buffer={len(raw_data)} bytes")
                 pcm16_data = raw_data
             elif codec == "pcm8":
                 pcm16_data = pcm8_to_pcm16(raw_data)
             else:
                 pcm16_data = raw_data
-            chunk_duration = len(pcm16_data) / (sample_rate * 2)
-            wav_data = pcm_to_wav(pcm16_data, sample_rate)
-            pcm_buffer = bytearray()
-            last_send = time.time()
-            segments = await transcribe_groq(wav_data, "audio.wav")
+
+            # 無音検出: RMS音量が閾値以下ならAPIを呼ばずスキップ
+            rms = _pcm16_rms(pcm16_data)
+            if rms < 50:
+                logger.info(f"Skipped silent chunk (RMS={rms:.0f}), buffer={len(raw_data)} bytes")
+                pcm_buffer = bytearray()
+                last_send = time.time()
+            else:
+                chunk_duration = len(pcm16_data) / (sample_rate * 2)
+                wav_data = pcm_to_wav(pcm16_data, sample_rate)
+                pcm_buffer = bytearray()
+                last_send = time.time()
+                logger.info(f"Sending audio (RMS={rms:.0f}), size={len(wav_data)} bytes")
+                segments = await transcribe_groq(wav_data, "audio.wav")
 
         # タイムスタンプにオフセットを加算
         for seg in segments:
