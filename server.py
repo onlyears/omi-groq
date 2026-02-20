@@ -24,7 +24,9 @@ GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "whisper-large-v3")
 LANGUAGE = os.environ.get("LANGUAGE", "ja")
 PROMPT = os.environ.get("PROMPT", "日本語の会話です")
-CHUNK_SECONDS = int(os.environ.get("CHUNK_SECONDS", "10"))
+CHUNK_SECONDS = int(os.environ.get("CHUNK_SECONDS", "30"))
+SILENCE_RMS_THRESHOLD = int(os.environ.get("SILENCE_RMS_THRESHOLD", "200"))
+DAILY_REQUEST_LIMIT = int(os.environ.get("DAILY_REQUEST_LIMIT", "1800"))  # Groq無料枠2000の90%
 
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO")
 logging.basicConfig(
@@ -34,6 +36,54 @@ logging.basicConfig(
 logger = logging.getLogger("omi-groq-stt")
 
 app = FastAPI(title="Omi-Groq STT Bridge")
+
+
+# ============================================================
+#  レート制限トラッキング
+# ============================================================
+
+class RateLimiter:
+    """日次APIリクエスト数を追跡し、制限を超えないようにする"""
+
+    def __init__(self, daily_limit: int):
+        self.daily_limit = daily_limit
+        self.request_count = 0
+        self.day_start = time.time()
+        self._rate_limited_until = 0.0  # 429受信時のバックオフ終了時刻
+
+    def _reset_if_new_day(self):
+        now = time.time()
+        if now - self.day_start >= 86400:
+            self.request_count = 0
+            self.day_start = now
+            self._rate_limited_until = 0.0
+            logger.info("Daily request counter reset")
+
+    def can_request(self) -> bool:
+        self._reset_if_new_day()
+        now = time.time()
+        if now < self._rate_limited_until:
+            return False
+        return self.request_count < self.daily_limit
+
+    def record_request(self):
+        self.request_count += 1
+        remaining = self.daily_limit - self.request_count
+        if remaining % 100 == 0 or remaining <= 50:
+            logger.info(f"API requests today: {self.request_count}/{self.daily_limit} (remaining: {remaining})")
+
+    def record_rate_limit(self, retry_after: float = 60.0):
+        """429レスポンスを受けた時、バックオフ期間を設定"""
+        self._rate_limited_until = time.time() + retry_after
+        logger.warning(f"Rate limited! Backing off for {retry_after:.0f}s. Requests today: {self.request_count}/{self.daily_limit}")
+
+    @property
+    def remaining(self) -> int:
+        self._reset_if_new_day()
+        return max(0, self.daily_limit - self.request_count)
+
+
+rate_limiter = RateLimiter(DAILY_REQUEST_LIMIT)
 
 
 # ============================================================
@@ -260,13 +310,20 @@ def is_hallucination(text: str) -> bool:
 
 async def transcribe_groq(audio_data: bytes, filename: str = "audio.wav") -> list:
     """Groq Whisper APIで文字起こし"""
-    from groq import Groq
+    from groq import Groq, RateLimitError
+
+    # レート制限チェック（API呼び出し前にスキップ）
+    if not rate_limiter.can_request():
+        logger.warning(f"Skipping API call: daily limit reached or rate limited (remaining: {rate_limiter.remaining})")
+        return []
 
     logger.info(f"Sending to Groq: filename={filename}, size={len(audio_data)} bytes")
 
     try:
-        client = Groq(api_key=GROQ_API_KEY, timeout=30.0)
+        # max_retries=0 で SDK の自動リトライを無効化（429時に無駄なリトライを防ぐ）
+        client = Groq(api_key=GROQ_API_KEY, timeout=30.0, max_retries=0)
 
+        rate_limiter.record_request()
         transcription = await asyncio.to_thread(
             client.audio.transcriptions.create,
             file=(filename, audio_data),
@@ -330,6 +387,11 @@ async def transcribe_groq(audio_data: bytes, filename: str = "audio.wav") -> lis
         logger.info(f"Transcribed: {len(segments)} segments")
         return segments
 
+    except RateLimitError as e:
+        logger.warning(f"Groq rate limit hit (429): {e}")
+        rate_limiter.record_rate_limit(retry_after=60.0)
+        return []
+
     except Exception as e:
         logger.error(f"Groq API error: {e}", exc_info=True)
         return []
@@ -384,7 +446,7 @@ async def listen(websocket: WebSocket):
 
             # 無音検出: RMS音量が閾値以下ならAPIを呼ばずスキップ
             rms = _pcm16_rms(pcm16_data)
-            if rms < 50:
+            if rms < SILENCE_RMS_THRESHOLD:
                 logger.info(f"Skipped silent chunk (RMS={rms:.0f}), buffer={len(raw_data)} bytes")
                 pcm_buffer = bytearray()
                 last_send = time.time()
