@@ -2,3 +2,7 @@ fastapi==0.115.*
 uvicorn[standard]==0.34.*
 groq==0.25.*
 websockets>=13.0
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch>=2.0.0
+torchaudio>=2.0.0
+onnxruntime>=1.16.0

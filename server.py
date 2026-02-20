@@ -15,6 +15,7 @@ import time
 import wave
 from typing import Optional
 
+import torch
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 
 # ============================================================
@@ -27,6 +28,9 @@ PROMPT = os.environ.get("PROMPT", "日本語の会話です")
 CHUNK_SECONDS = int(os.environ.get("CHUNK_SECONDS", "30"))
 SILENCE_RMS_THRESHOLD = int(os.environ.get("SILENCE_RMS_THRESHOLD", "200"))
 DAILY_REQUEST_LIMIT = int(os.environ.get("DAILY_REQUEST_LIMIT", "1800"))  # Groq無料枠2000の90%
+VAD_ENABLED = os.environ.get("VAD_ENABLED", "true").lower() == "true"
+VAD_THRESHOLD = float(os.environ.get("VAD_THRESHOLD", "0.5"))  # 0.0〜1.0、高いほど厳しい
+VAD_MIN_SPEECH_MS = int(os.environ.get("VAD_MIN_SPEECH_MS", "250"))  # これ以下の発話は無視
 
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO")
 logging.basicConfig(
@@ -36,6 +40,52 @@ logging.basicConfig(
 logger = logging.getLogger("omi-groq-stt")
 
 app = FastAPI(title="Omi-Groq STT Bridge")
+
+
+# ============================================================
+#  Silero VAD（Voice Activity Detection）
+# ============================================================
+
+vad_model = None
+get_speech_timestamps = None
+
+if VAD_ENABLED:
+    try:
+        _vad_model, _vad_utils = torch.hub.load(
+            repo_or_dir="snakers4/silero-vad",
+            model="silero_vad",
+            force_reload=False,
+            onnx=True,
+        )
+        vad_model = _vad_model
+        get_speech_timestamps = _vad_utils[0]
+        logger.info(f"Silero VAD loaded (ONNX, threshold={VAD_THRESHOLD}, min_speech={VAD_MIN_SPEECH_MS}ms)")
+    except Exception as e:
+        logger.warning(f"Failed to load Silero VAD, falling back to RMS only: {e}")
+        VAD_ENABLED = False
+
+
+def detect_speech_in_pcm16(pcm16_data: bytes, sample_rate: int = 16000) -> bool:
+    """PCM16 LE 音声データに人の声が含まれるかを Silero VAD で判定する。
+
+    Returns:
+        True: 発話が検出された（Groq に送るべき）
+        False: 発話なし（スキップすべき）
+    """
+    if vad_model is None or get_speech_timestamps is None:
+        return True  # VAD が使えない場合は常に送信
+
+    audio_tensor = torch.frombuffer(pcm16_data, dtype=torch.int16).float() / 32768.0
+
+    speech_timestamps = get_speech_timestamps(
+        audio_tensor,
+        vad_model,
+        sampling_rate=sample_rate,
+        threshold=VAD_THRESHOLD,
+        min_speech_duration_ms=VAD_MIN_SPEECH_MS,
+    )
+
+    return len(speech_timestamps) > 0
 
 
 # ============================================================
@@ -444,19 +494,30 @@ async def listen(websocket: WebSocket):
             else:
                 pcm16_data = raw_data
 
-            # 無音検出: RMS音量が閾値以下ならAPIを呼ばずスキップ
+            # 無音検出: まず軽量な RMS チェックで明らかな無音を弾く（VAD の計算コスト節約）
             rms = _pcm16_rms(pcm16_data)
             if rms < SILENCE_RMS_THRESHOLD:
                 logger.info(f"Skipped silent chunk (RMS={rms:.0f}), buffer={len(raw_data)} bytes")
                 pcm_buffer = bytearray()
                 last_send = time.time()
-            else:
-                chunk_duration = len(pcm16_data) / (sample_rate * 2)
-                wav_data = pcm_to_wav(pcm16_data, sample_rate)
-                pcm_buffer = bytearray()
-                last_send = time.time()
-                logger.info(f"Sending audio (RMS={rms:.0f}), size={len(wav_data)} bytes")
-                segments = await transcribe_groq(wav_data, "audio.wav")
+                return []
+
+            # RMS を通過した音声に対して Silero VAD で発話判定
+            if VAD_ENABLED:
+                has_speech = await asyncio.to_thread(detect_speech_in_pcm16, pcm16_data, sample_rate)
+                if not has_speech:
+                    logger.info(f"Skipped by VAD (no speech detected, RMS={rms:.0f})")
+                    pcm_buffer = bytearray()
+                    last_send = time.time()
+                    return []
+
+            # 発話あり → Groq API に送信
+            chunk_duration = len(pcm16_data) / (sample_rate * 2)
+            wav_data = pcm_to_wav(pcm16_data, sample_rate)
+            pcm_buffer = bytearray()
+            last_send = time.time()
+            logger.info(f"VAD: speech detected (RMS={rms:.0f}), sending to Groq")
+            segments = await transcribe_groq(wav_data, "audio.wav")
 
         # タイムスタンプにオフセットを加算
         for seg in segments:
@@ -533,7 +594,13 @@ async def listen(websocket: WebSocket):
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "model": WHISPER_MODEL, "language": LANGUAGE}
+    return {
+        "status": "ok",
+        "model": WHISPER_MODEL,
+        "language": LANGUAGE,
+        "vad_enabled": VAD_ENABLED,
+        "vad_threshold": VAD_THRESHOLD,
+    }
 
 
 @app.get("/")
